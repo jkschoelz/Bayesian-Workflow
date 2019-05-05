@@ -1,0 +1,288 @@
+---
+title: "Illustrating Bayesian workflow with an alpha decay experiment"
+author: "Kevin Schoelz"
+date: "April, 2019"
+output:
+  tufte::tufte_html:
+    toc: true
+    toc_depth: 1
+
+---
+
+
+```{r setup, include=FALSE}
+
+rm(list = ls())
+gc(reset = TRUE)
+
+
+knitr::opts_chunk$set(
+  include = TRUE,
+  cache = TRUE,
+  collapse = TRUE,
+  echo = TRUE,
+  message = FALSE,
+  tidy = FALSE,
+  warning = FALSE,
+  comment = "  ",
+  dev = "png",
+  dev.args = list(bg = '#FFFFF8'),
+  dpi = 300,
+  fig.align = "center",
+  #fig.width = 7,
+  #fig.asp = 0.618,
+  fig.show = "hold",
+  out.width = "90%"
+)
+
+
+```
+
+This document is to help me work with issues related to Bayesian workflow. It is closely related to Michael Betancourt's notebook located [here](https://betanalpha.github.io/assets/case_studies/principled_bayesian_workflow.html). 
+
+In this notebook, we have experimental data from an alpha-decay experiment. We want to find
+
+The basic steps that we want to follow are
+1.) Describe the experiment/Build the model
+2.) Prior Predictive Check
+3.) Simulated data and check of computational fidelity of posterior distribution
+4.) Posterior Predictive Check
+
+
+## Radioactive decay
+
+This notebook is looking at at an undergraduate experiment involving the radioactive decay of atoms, as well as the types of shielding necessary 
+Alpha decay is a form of radioactive decay, in which a large unstable nucleus loses an alpha particle (essentially a helium nucleus), in order to become more stable. Atomic nuclei  are bound together using the strong nuclear force. The strong nuclear force is an attractive force between nucleons (either protons or neutrons). However protons have an electrostatic repulsion. As the size of the nucleus increases, the repulsive force grows faster than the attractive force, decreasing the stability of the nucleus. Very heavy nuclei can become more stable by ejecting an alpha particle (two neutrons and two protons bound together). This reduces the overall electrostatic potential of the nucleus, making it a little more stable. The probability of a decay over any given time interval is constant, if we record many trials for a set time we expect to observe Poisson distributed data.
+
+We don't have radioactive decay data, so we will simulate some data from a Stan simulation: "true_data_generating_process.stan". In this data, we record the number of decay counts for a set time interval. We will perform 1000 replications. If all goes well, this should lead to Poisson distributed data.
+
+Our first step involves loading necessary libraries and setting up some notebook specific settings.
+
+```{r load_libraries}
+
+library(tidyverse)
+library(rstan)
+library(foreach)
+library(doParallel)
+library(tufte)
+library(bayesplot)
+library(cowplot)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+#ggplot2 settings
+theme_set(theme_minimal())
+
+```
+
+Now let's simulate our data.
+
+```{r true_fit}
+
+true_fit <- stan(file='true_data_generating_process.stan', iter=1,
+                 seed=425435, chains=1, algorithm="Fixed_param")
+
+```
+
+Finally, we can extract our data from the stanfit object. For now let's display the data in a histogram.
+
+```{r visualize_true_data}
+
+yobs = extract(true_fit)$y[1,]
+Nobs = length(yobs)
+
+yobs <- as.data.frame(yobs)
+
+# You should do something to clean up ggplot
+
+#head(yobs)
+
+dataplot <-ggplot(data = yobs, aes(x=yobs)) + 
+  geom_histogram(binwidth = 1, color = "black", fill = "dodgerblue4") +
+  xlab("Alpha Decay Events") +
+  ylab("Count") +
+  xlim(-1,15)
+
+dataplot
+
+```
+
+
+## Model Checking
+
+Now that we have our "experimental" data, we can go about the model building (and checking) process. In this process we will:
+
+1.) Conceptual Analysis
+2.) Define Observations
+3.) Identify relevant summary statistics
+4.) Build a model
+5.) Identify new summary statistics
+6.) Analyze the joint ensemble
+7.) Fit the observations and evaluate
+
+We will take each step in turn.
+
+### Conceptual Analysis
+
+### Define Observations
+
+Our observations consist of 1000 replications of a simple decay counting experiment.
+
+### Identify relevant summary statistics
+
+We want to identify the rate parameter $\lambda$ for our Poisson distributed data.
+
+### Build a model
+
+We expect the model to be Poisson distributed. So we build a simple hierarchical model with
+
+$$
+\begin{alignat*}{6}
+&\lambda &\sim &~N^{+}(0;10) \\
+&y_{obs} &\sim &~\text{Poisson}(\lambda)
+\end{alignat*}
+$$
+
+### Identify new summary statistics
+
+No new summary statistics
+
+### Analyze the joint ensemble
+
+
+```{r}
+
+# Repitions
+R = 1000
+
+joint_ensemble_data = list(Nobs = Nobs)
+
+joint_ensemble_fit <- stan(file='sample_joint_ensemble.stan', data=joint_ensemble_data,
+                      iter=R, warmup=0, chains=1,
+                      algorithm="Fixed_param")
+
+```
+
+
+Extracting the data we get
+
+```{r}
+
+joint_ensemble_df <- as.data.frame(joint_ensemble_fit)
+
+#head(joint_ensemble_df)
+
+ggplot(data = joint_ensemble_df, aes(x=lam)) + 
+  geom_histogram(bins = 45, color = "black", fill = "dodgerblue4") + 
+  xlab("Rate (events/sec)") 
+
+simu_ys <- extract(joint_ensemble_fit)$y
+simu_lambda <- extract(joint_ensemble_fit)$lam
+
+simu_list <- t(as.matrix(data.frame(simu_lambda, simu_ys)))
+
+
+```
+
+Now we have 1000 sets of data. Let's fit all of them. If we fit all of them and average the results, we should be able to compute the data averaged posterior, which would help us recover the prior distribution.
+
+```{r data_averaged_posterior}
+
+
+registerDoParallel(makeCluster(detectCores()))
+fit_model <- stan_model(file = "fit_data.stan")
+
+ensemble_output <- foreach(simu=simu_list, .combine=cbind) %dopar% {
+  simu_lambda <- simu[1]
+  simu_ys <- simu[2:Nobs+1]
+  simu_N <- Nobs-1
+  simu_data <- list(Nobs = simu_N,
+                   yobs = simu_ys)
+  capture.output(library(rstan))
+  capture.output(fit <- sampling(fit_model, data = simu_data))
+
+  util <- new.env()
+  source('stan_utility.R', local=util)
+
+  warning_code <- util$check_all_diagnostics(fit, quiet=TRUE)
+
+  # Compute rank of prior draw with respect to thinned posterior draws
+  sbc_rank <- sum(simu_lambda < extract(fit)$lam[seq(1, 4000 - 8, 8)])
+
+  # Compute posterior sensitivities
+  s <- summary(fit, probs = c(), pars='lam')$summary
+  post_mean_lambda <- s[,1]
+  post_sd_lambda <- s[,3]
+
+  prior_sd_lambda <- 6
+  z_score <- (post_mean_lambda - simu_lambda) / post_sd_lambda
+  shrinkage <- 1 - (post_sd_lambda / prior_sd_lambda)**2
+
+  c(warning_code, sbc_rank, z_score, shrinkage)
+
+}
+
+ensemble_ouput <- as.data.frame(t(ensemble_output))
+
+#colnames(ensemble_output) <- c("warning_codes", "sbc_rank", "z-score", "shrinkage")
+
+#head(ensemble_ouput)
+
+
+```
+
+
+```{r}
+
+sbc_plot <- ggplot(data = ensemble_ouput, aes(x=V2)) +
+  geom_histogram(bins = 25, color = "black", fill = "dodgerblue4") + 
+  xlab("SBC Rank") +
+  ylab("Count")
+
+zscore_vs_shrinkage <-ggplot(data = ensemble_ouput, aes(x=V4, y=V3)) + 
+  geom_point(color = "dodgerblue4") + 
+  xlab("Posterior Z-score") + 
+  ylab("Posterior Shrinkage") + 
+  xlim(0,1)
+
+plot_grid(sbc_plot, zscore_vs_shrinkage, ncol = 1, align = "v")
+
+```
+
+### Fit the observations and evaluate
+
+We want to fit the data
+
+```{r}
+
+postpred_data = list(Nobs = Nobs,
+                     yobs = yobs$yobs)
+
+postpred_fit <- stan(file='fit_data_with_ppf.stan', data=postpred_data,
+                     iter=1000, chains=4, seed=4838282, control=list(adapt_delta=0.99))
+
+```
+
+Pairs plot for a first pass at diagnostics
+
+
+
+Put data into nicer form
+
+```{r}
+
+postpred_df <- as.data.frame(postpred_fit)
+
+postpred_df_tidy <- postpred_df %>%
+  gather(key = "bin", value = "Counts", 2:1001)
+
+#head(postpred_df_tidy)
+
+ppf_plot <- ggplot(data = postpred_df_tidy, aes(x=Counts)) + 
+  geom_histogram(bins = 15, color = "black", fill = "dodgerblue4") +
+  xlim(-1,15)
+
+plot_grid(dataplot, ppf_plot, ncol = 1, align = "v")
+
+```
